@@ -1,0 +1,3 @@
+GuidAR/Goal goal
+---
+trajectory_msgs/JointTrajectory trajectory

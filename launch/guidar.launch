@@ -1,0 +1,4 @@
+<launch>
+  <!-- GuidAR diffusion service node (Python / PyTorch) -->
+  <node name="guidar_services" pkg="guidar" type="guidar_services.py" output="screen" />
+</launch>
