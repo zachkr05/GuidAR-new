@@ -46,7 +46,7 @@ VICON_TOPICS = {
     "chair": "/vicon/chair_1/chair_1",
     "table": "/vicon/table_1/table_1",
 }
-ROBOT_TOPIC = "/vicon/Rosbot_AR_2/Rosbot_AR_2"
+ROBOT_TOPIC = "/vicon/Rosbot_8_AR/Rosbot_8_AR"
 CHECKPOINT  = os.path.join(DIFFUSION_ROOT, "checkpoints/checkpoint_epoch8.pt")
 
 H, W = 128, 128                # costmap resolution
@@ -259,9 +259,17 @@ class GuidARServices:
         mn, mx = fused_np.min(), fused_np.max()
         normed = (fused_np - mn) / (mx - mn + 1e-8) + 1e-8
 
+        with self.lock:
+            robot_pose = self.robot_pose
+
+        if robot_pose is None:
+            raise rospy.ServiceException("No robot pose received!")
+
+        start_r, start_c = world_to_pixel(*robot_pose)
+
         goal_r, goal_c = int(np.clip(goal[0], 0, H - 1)), int(np.clip(goal[1], 0, W - 1))
         path_result = route_through_array(
-            normed, [0, 0], [goal_r, goal_c], fully_connected=True, geometric=True
+            normed, [start_r, start_c], [goal_r, goal_c], fully_connected=True, geometric=True
         )
         path_arr = np.array(path_result[0])
         x_px = path_arr[:, 1]  # col

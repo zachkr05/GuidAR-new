@@ -1,1 +1,1 @@
-guidAR/ARObstacle[] obstacles
+GuidAR/ARObstacle[] obstacles

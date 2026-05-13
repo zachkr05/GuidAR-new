@@ -13,7 +13,12 @@ find_package(catkin REQUIRED COMPONENTS
 ## Messages
 add_message_files(FILES
   Goal.msg
-)
+  ObstacleListList.msg
+  ObstacleList.msg
+  Obstacle.msg
+  Point.msg
+  PotentialFieldMsg.msg
+  ARObstacle.msg)
 
 ## Services
 add_service_files(FILES
