@@ -43,10 +43,10 @@ from utils.spline import generate_clamped_spline, clamped_knots
 OBSTACLE_CLASSES = ["chair", "table", "bomb"]
 VICON_TOPICS = {
     "bomb":  "/vicon/bomb_1/bomb_1",
-    "chair": "/vicon/chair_1/chair_1",
+    "chair": "/vicon/Chair_1/Chair_1",
     "table": "/vicon/table_1/table_1",
 }
-ROBOT_TOPIC = "/vicon/Rosbot_8_AR/Rosbot_8_AR"
+ROBOT_TOPIC = "/vicon/rosbot_8_AR/rosbot_8_AR"
 CHECKPOINT  = os.path.join(DIFFUSION_ROOT, "checkpoints/checkpoint_epoch8.pt")
 
 H, W = 128, 128                # costmap resolution
