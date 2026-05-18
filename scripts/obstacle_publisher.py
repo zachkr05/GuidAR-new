@@ -8,6 +8,7 @@ Hosts three services consumed by the Unity AR client:
   /executeTrajectory           – flip the MPCC execution flag
 
 Subscribes to Vicon for live obstacle poses (bomb_1, chair_1, table_1).
+Publishes obstacle poses to Unity as PotentialFieldMsg.
 """
 from scipy.ndimage import gaussian_filter1d
 import sys
@@ -18,13 +19,15 @@ import torch
 import torch.nn.functional as F
 
 import rospy
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, Transform, Vector3, Quaternion
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from std_msgs.msg import Empty as EmptyMsg
 from std_srvs.srv import Empty, EmptyResponse, EmptyRequest
 
 from skimage.graph import route_through_array
 from scipy.interpolate import BSpline
+
+from GuidAR.msg import PotentialFieldMsg, ARObstacle
 
 # ---------------------------------------------------------------------------
 # Adjust this path so Python can find the guidAR-Diffusion package
@@ -59,74 +62,6 @@ SPLINE_DEGREE = 3
 DDPM_TIMESTEPS = 1000
 
 
-from GuidAR.msg import PotentialFieldMsg, ARObstacle
-from geometry_msgs.msg import Transform, Vector3, Quaternion
-
-# --- Add to __init__ (wherever your Vicon subscribers are set up) ---
-
-# Publisher for Unity ObstacleManager
-self.obstacle_pub = rospy.Publisher(
-    "/server/potentialfieldpublisheforunity",
-    PotentialFieldMsg,
-    queue_size=1,
-    latch=True,
-)
-
-# Timer to republish at ~5 Hz
-self.obstacle_pub_timer = rospy.Timer(
-    rospy.Duration(0.2), self._publish_obstacles_to_unity
-)
-
-
-def _publish_obstacles_to_unity(self, event=None):
-    """
-    Publish current Vicon obstacle poses as PotentialFieldMsg
-    so Unity's ObstacleManager can render them in AR.
-    """
-    msg = PotentialFieldMsg()
-    obstacles_out = []
-
-    # self.bomb, self.chair, self.table are dicts with 'position' and 'orientation'
-    # from your Vicon callbacks (bomb_cb, chair_cb, table_cb)
-    vicon_objects = {
-        "chair_1": self.chair,
-        "table_1": self.table,
-        "bomb_1":  self.bomb,
-    }
-
-    for obj_id, data in vicon_objects.items():
-        if data is None:
-            continue
-
-        obs = ARObstacle()
-        obs.id = obj_id
-
-        obs.transform = Transform()
-        obs.transform.translation = Vector3(
-            x=data["position"][0],
-            y=data["position"][1],
-            z=data["position"][2],
-        )
-        obs.transform.rotation = Quaternion(
-            x=data["orientation"][0],
-            y=data["orientation"][1],
-            z=data["orientation"][2],
-            w=data["orientation"][3],
-        )
-
-        # Random/default params — these don't affect anything
-        obs.radius = 0.5
-        obs.sigma = 1.0
-        obs.amplitude = 1.0
-
-        obstacles_out.append(obs)
-
-    msg.obstacles = obstacles_out
-    self.obstacle_pub.publish(msg)
-
-
-
-
 # ===================================================================
 #  Coordinate helpers
 # ===================================================================
@@ -159,9 +94,23 @@ class GuidARServices:
         self.obstacle_poses = {cls: None for cls in OBSTACLE_CLASSES}
         self.robot_pose = None
 
+        # Full Vicon data (position + orientation) for Unity publishing
+        self.vicon_full = {cls: None for cls in OBSTACLE_CLASSES}
+
         for cls, topic in VICON_TOPICS.items():
             rospy.Subscriber(topic, TransformStamped, self._vicon_cb, callback_args=cls)
         rospy.Subscriber(ROBOT_TOPIC, TransformStamped, self._robot_cb)
+
+        # ----- obstacle publisher for Unity ObstacleManager -----
+        self.obstacle_pub = rospy.Publisher(
+            "/server/potentialfieldpublisheforunity",
+            PotentialFieldMsg,
+            queue_size=1,
+            latch=True,
+        )
+        self.obstacle_pub_timer = rospy.Timer(
+            rospy.Duration(0.2), self._publish_obstacles_to_unity
+        )
 
         # ----- diffusion model -----
         n_classes = len(OBSTACLE_CLASSES)
@@ -187,20 +136,12 @@ class GuidARServices:
         )
 
         # ----- service servers -----
-        # generateTrajectory uses custom messages compiled from your GuidAR package.
-        # Import them here so the node fails fast if they're missing.
-        from GuidAR.srv import (              # <-- adjust package name
+        from GuidAR.srv import (
             generateTraj, generateTrajResponse,
             modifyTrajectory, modifyTrajectoryResponse,
         )
         self.gen_srv = rospy.Service(
             "/server/generateTrajectory", generateTraj, self._handle_generate
-        )
-        self.mod_srv = rospy.Service(
-            "/server/modifyTrajectory", modifyTrajectory, self._handle_modify
-        )
-        self.exec_srv = rospy.Service(
-            "/executeTrajectory", Empty, self._handle_execute
         )
 
         rospy.loginfo("[GuidAR] All services advertised.")
@@ -210,8 +151,13 @@ class GuidARServices:
     # ------------------------------------------------------------------
     def _vicon_cb(self, msg, cls):
         t = msg.transform.translation
+        r = msg.transform.rotation
         with self.lock:
             self.obstacle_poses[cls] = (t.x, t.y)
+            self.vicon_full[cls] = {
+                "position": (t.x, t.y, t.z),
+                "orientation": (r.x, r.y, r.z, r.w),
+            }
 
     def _robot_cb(self, msg):
         t = msg.transform.translation
@@ -219,35 +165,75 @@ class GuidARServices:
             self.robot_pose = (t.x, t.y)
 
     # ------------------------------------------------------------------
+    #  Publish obstacles to Unity
+    # ------------------------------------------------------------------
+    def _publish_obstacles_to_unity(self, event=None):
+        """
+        Publish current Vicon obstacle poses as PotentialFieldMsg
+        so Unity's ObstacleManager can render them in AR.
+        """
+        with self.lock:
+            vicon_snapshot = dict(self.vicon_full)
+
+        msg = PotentialFieldMsg()
+        obstacles_out = []
+
+        class_to_id = {
+            "chair": "Chair_1",
+            "table": "Table_1",
+            "bomb":  "Bomb_1",
+        }
+
+        for cls, obj_id in class_to_id.items():
+            data = vicon_snapshot.get(cls)
+            if data is None:
+                continue
+
+            obs = ARObstacle()
+            obs.id = obj_id
+            obs.transform = Transform()
+            obs.transform.translation = Vector3(
+                x=data["position"][0],
+                y=data["position"][1],
+                z=data["position"][2],
+            )
+            obs.transform.rotation = Quaternion(
+                x=data["orientation"][0],
+                y=data["orientation"][1],
+                z=data["orientation"][2],
+                w=data["orientation"][3],
+            )
+            obs.radius = 0.5
+            obs.sigma = 1.0
+            obs.amplitude = 1.0
+
+            obstacles_out.append(obs)
+
+        msg.obstacles = obstacles_out
+        self.obstacle_pub.publish(msg)
+
+    # ------------------------------------------------------------------
     #  Build conditioning tensors from live Vicon data
     # ------------------------------------------------------------------
     def _build_batch_from_vicon(self, goal_world):
-        """
-        Mimics CostmapDataset.__getitem__ but uses live obstacle positions.
-        Returns the same (features, targets, positions, radii, goal, angles)
-        tuple the model expects — with batch dim 1.
-        """
         with self.lock:
             poses_snapshot = dict(self.obstacle_poses)
 
-        # Build obstacles_by_class in the same format as the dataset
         obstacles_by_class = {}
         for cls in OBSTACLE_CLASSES:
             if poses_snapshot[cls] is not None:
                 r, c = world_to_pixel(*poses_snapshot[cls])
                 obstacles_by_class[cls] = [{
                     "pos": np.array([r, c]),
-                    "rad": 2,           # default radius; adjust per-object if needed
+                    "rad": 2,
                     "angle": 0.0,
                 }]
             else:
                 obstacles_by_class[cls] = []
 
-        # Goal
         goal_r, goal_c = world_to_pixel(*goal_world)
         goal = np.array([goal_r, goal_c])
 
-        # --- Costmap conditioning (mirrors CostmapDataset) ---
         cm = Costmap(H=H, W=W)
         cm.goal = goal
         costmaps, radii_maps, binary_occ, sin_maps, cos_maps = cm.calculateCost(
@@ -284,12 +270,11 @@ class GuidARServices:
                  other_bin, other_rad, other_sin, other_cos, goal_t],
                 dim=0,
             )
-            features[key] = x.unsqueeze(0)                # add batch dim
+            features[key] = x.unsqueeze(0)
             targets[key] = (
                 torch.from_numpy(costmaps[key].copy()).float().unsqueeze(0).unsqueeze(0)
             )
 
-        # positions / radii dicts (list-of-dicts with batch dim)
         positions = {}
         radii_dict = {}
         for cls, obs_list in obstacles_by_class.items():
@@ -310,7 +295,6 @@ class GuidARServices:
             goal_world
         )
 
-        # --- per-expert DDPM sampling ---
         diffused = {}
         for cls in OBSTACLE_CLASSES:
             cond = features[cls].to(self.device)
@@ -318,12 +302,10 @@ class GuidARServices:
             generated = self.ddpm.sample(self.model.experts[cls], cond, shape=gt.shape)
             diffused[cls] = [generated]
 
-        # --- logsumexp fusion ---
         stacked = torch.stack([v[0].squeeze(1) for v in diffused.values()], dim=1)
         fused = torch.logsumexp(stacked, dim=1).unsqueeze(1)
         fused_np = fused[0, 0].cpu().numpy()
 
-        # --- A* through fused costmap ---
         mn, mx = fused_np.min(), fused_np.max()
         normed = (fused_np - mn) / (mx - mn + 1e-8) + 1e-8
 
@@ -334,14 +316,10 @@ class GuidARServices:
             raise rospy.ServiceException("No robot pose received!")
 
         start_r, start_c = world_to_pixel(*robot_pose)
-
         goal_r, goal_c = int(np.clip(goal[0], 0, H - 1)), int(np.clip(goal[1], 0, W - 1))
         path_result = route_through_array(
             normed, [start_r, start_c], [goal_r, goal_c], fully_connected=True, geometric=True
         )
-        #path_arr = np.array(path_result[0])
-        #x_px = path_arr[:, 1]  # col
-        #y_px = path_arr[:, 0]  # row
 
         path_arr = np.array(path_result[0])
         sigma = 5
@@ -350,10 +328,8 @@ class GuidARServices:
         x_px[0], x_px[-1] = path_arr[0, 1], path_arr[-1, 1]
         y_px[0], y_px[-1] = path_arr[0, 0], path_arr[-1, 0]
 
-        # --- fit B-spline ---
         x_s, y_s, P, U = generate_clamped_spline(x_px, y_px, SPLINE_DEGREE, NUM_CTRL_PTS)
 
-        # convert spline samples to world coords
         world_pts = [pixel_to_world(y_s[i], x_s[i]) for i in range(len(x_s))]
         ctrl_world = [pixel_to_world(P[i, 1], P[i, 0]) for i in range(len(P))]
 
@@ -371,19 +347,16 @@ class GuidARServices:
 
         world_pts, ctrl_world, P, U = self._generate_costmap_and_path((goal_x, goal_y))
 
-        # Build JointTrajectory  (same format mpcc_ros trajectorycb expects)
         traj = JointTrajectory()
         traj.header.stamp = rospy.Time.now()
         traj.header.frame_id = "vicon/world"
 
-        # Parameterise by cumulative arc-length
         arc = [0.0]
         for i in range(1, len(world_pts)):
             dx = world_pts[i][0] - world_pts[i - 1][0]
             dy = world_pts[i][1] - world_pts[i - 1][1]
             arc.append(arc[-1] + np.hypot(dx, dy))
 
-        # Downsample to ~200 points to keep the message lean
         total_len = arc[-1]
         n_out = min(len(world_pts), 200)
         indices = np.linspace(0, len(world_pts) - 1, n_out, dtype=int)
@@ -394,12 +367,10 @@ class GuidARServices:
             pt.time_from_start = rospy.Duration.from_sec(arc[idx])
             traj.points.append(pt)
 
-        # Cache knots/ctrl pts for later modify calls
         self.current_knots = U.tolist()
         self.current_ctrl_x = [c[0] for c in ctrl_world]
         self.current_ctrl_y = [c[1] for c in ctrl_world]
 
-        # Also publish on /reference_trajectory so MPCC picks it up
         self.traj_pub.publish(traj)
 
         resp = generateTrajResponse()
@@ -427,27 +398,43 @@ class GuidARServices:
         xs = splx(t_eval)
         ys = sply(t_eval)
 
-        # Smooth the modified path to remove kinks
-        sigma = 3  # lighter than generation since user edits are intentional
+        sigma = 3
         xs = gaussian_filter1d(xs, sigma)
         ys = gaussian_filter1d(ys, sigma)
-        # Pin endpoints
         xs[0], xs[-1] = float(ctrl_x[0]), float(ctrl_x[-1])
         ys[0], ys[-1] = float(ctrl_y[0]), float(ctrl_y[-1])
 
-
-        # Subsample — MPCC refits its own splines anyway
-
         indices = np.linspace(0, len(xs) - 1, 40, dtype=int)
-
         xs = xs[indices]
-
         ys = ys[indices]
 
-        # Build JointTrajectory with arc-length parameterisation
         arc = [0.0]
         for i in range(1, len(xs)):
             arc.append(arc[-1] + np.hypot(xs[i] - xs[i - 1], ys[i] - ys[i - 1]))
+
+         # ---- ADD HERE: Ensure minimum length for MPCC ----
+        MIN_LENGTH = 4.5
+        if arc[-1] < MIN_LENGTH:
+            dx = world_pts[-1][0] - world_pts[-2][0]
+            dy = world_pts[-1][1] - world_pts[-2][1]
+            seg = np.hypot(dx, dy)
+            if seg > 1e-8:
+                dx /= seg
+                dy /= seg
+            else:
+                dx, dy = 1.0, 0.0
+
+            while arc[-1] < MIN_LENGTH:
+                step = 0.05
+                new_x = world_pts[-1][0] + dx * step
+                new_y = world_pts[-1][1] + dy * step
+                world_pts.append((new_x, new_y))
+                arc.append(arc[-1] + step)
+
+            rospy.loginfo(f"[GuidAR] Extended trajectory to {arc[-1]:.2f} m")
+
+        total_len = arc[-1]
+        n_out = min(len(world_pts), 200)
 
         traj = JointTrajectory()
         traj.header.stamp = rospy.Time.now()
@@ -459,7 +446,6 @@ class GuidARServices:
             pt.time_from_start = rospy.Duration.from_sec(arc[i])
             traj.points.append(pt)
 
-        # Cache & publish
         self.current_knots = knots.tolist()
         self.current_ctrl_x = ctrl_x.tolist()
         self.current_ctrl_y = ctrl_y.tolist()
